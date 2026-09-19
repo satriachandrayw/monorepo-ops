@@ -1,0 +1,4 @@
+# Go and local build artifacts
+**/bin/
+**/dist/
+**/coverage/

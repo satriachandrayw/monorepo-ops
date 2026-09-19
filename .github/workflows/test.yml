@@ -1,0 +1,26 @@
+name: Test operations plugins
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  resilient-git:
+    name: Test resilient Git plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Run Go tests
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE/plugins/woodpecker-git-resilient:/src:ro"
+          -w /src golang:1.24-alpine go test ./...
+      - name: Run Go vet
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE/plugins/woodpecker-git-resilient:/src:ro"
+          -w /src golang:1.24-alpine go vet ./...
