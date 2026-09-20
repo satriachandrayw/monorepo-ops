@@ -94,6 +94,19 @@ func TestDurationSecondsRoundsUp(t *testing.T) {
 	}
 }
 
+func TestBuildSSHCommandIncludesHostKeyAlias(t *testing.T) {
+	command := buildSSHCommand(config{
+		Home:                   "/root",
+		SSHConnectTimeout:      10 * time.Second,
+		SSHServerAliveInterval: 5 * time.Second,
+		SSHServerAliveCountMax: 3,
+		SSHHostKeyAlias:        "github.com",
+	})
+	if !strings.Contains(command, "-o HostKeyAlias='github.com'") {
+		t.Fatalf("SSH command = %q, want host key alias", command)
+	}
+}
+
 func TestErrorKind(t *testing.T) {
 	if got := errorKind(ErrIdleTimeout); got != "idle-timeout" {
 		t.Fatalf("errorKind(idle) = %q, want idle-timeout", got)

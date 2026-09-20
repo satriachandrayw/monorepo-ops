@@ -39,6 +39,7 @@ type config struct {
 	SSHServerAliveCountMax int
 	SSHKeyPrivate          string
 	SSHHostKey             string
+	SSHHostKeyAlias        string
 	NetrcMachine           string
 	NetrcUsername          string
 	NetrcPassword          string
@@ -78,6 +79,7 @@ func loadConfig() (config, error) {
 		SSHServerAliveCountMax: envInt("PLUGIN_SSH_SERVER_ALIVE_COUNT_MAX", 3),
 		SSHKeyPrivate:          os.Getenv("PLUGIN_SSH_KEY_PRIVATE"),
 		SSHHostKey:             os.Getenv("PLUGIN_SSH_HOST_KEY"),
+		SSHHostKeyAlias:        os.Getenv("PLUGIN_SSH_HOST_KEY_ALIAS"),
 		NetrcMachine:           os.Getenv("CI_NETRC_MACHINE"),
 		NetrcUsername:          os.Getenv("CI_NETRC_USERNAME"),
 		NetrcPassword:          os.Getenv("CI_NETRC_PASSWORD"),
@@ -191,12 +193,7 @@ func initializeRepository(cfg config, output io.Writer) error {
 		return fmt.Errorf("configure origin: %w", err)
 	}
 	if cfg.UseSSH {
-		sshCommand := "ssh -i " + shellQuote(filepath.Join(cfg.Home, "sshkey")) +
-			" -o UserKnownHostsFile=" + shellQuote(filepath.Join(cfg.Home, ".ssh", "known_hosts")) +
-			" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectionAttempts=1" +
-			" -o ConnectTimeout=" + strconv.Itoa(durationSeconds(cfg.SSHConnectTimeout)) +
-			" -o ServerAliveInterval=" + strconv.Itoa(durationSeconds(cfg.SSHServerAliveInterval)) +
-			" -o ServerAliveCountMax=" + strconv.Itoa(cfg.SSHServerAliveCountMax)
+		sshCommand := buildSSHCommand(cfg)
 		if err := runGit(cfg, output, "-C", cfg.Workspace, "config", "--global", "core.sshCommand", sshCommand); err != nil {
 			return fmt.Errorf("configure SSH: %w", err)
 		}
@@ -259,6 +256,19 @@ func errorKind(err error) string {
 	default:
 		return "git-error"
 	}
+}
+
+func buildSSHCommand(cfg config) string {
+	sshCommand := "ssh -i " + shellQuote(filepath.Join(cfg.Home, "sshkey")) +
+		" -o UserKnownHostsFile=" + shellQuote(filepath.Join(cfg.Home, ".ssh", "known_hosts")) +
+		" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectionAttempts=1" +
+		" -o ConnectTimeout=" + strconv.Itoa(durationSeconds(cfg.SSHConnectTimeout)) +
+		" -o ServerAliveInterval=" + strconv.Itoa(durationSeconds(cfg.SSHServerAliveInterval)) +
+		" -o ServerAliveCountMax=" + strconv.Itoa(cfg.SSHServerAliveCountMax)
+	if cfg.SSHHostKeyAlias != "" {
+		sshCommand += " -o HostKeyAlias=" + shellQuote(cfg.SSHHostKeyAlias)
+	}
+	return sshCommand
 }
 
 func durationSeconds(value time.Duration) int {
