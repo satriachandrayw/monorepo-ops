@@ -21,26 +21,29 @@ var (
 )
 
 type config struct {
-	Workspace       string
-	Commit          string
-	Branch          string
-	Remote          string
-	RemoteSSH       string
-	UseSSH          bool
-	Depth           int
-	Tags            bool
-	Attempts        int
-	Backoff         time.Duration
-	FetchTimeout    time.Duration
-	IdleTimeout     time.Duration
-	ProtocolVersion string
-	SSHKeyPrivate   string
-	SSHHostKey      string
-	NetrcMachine    string
-	NetrcUsername   string
-	NetrcPassword   string
-	Home            string
-	GitBinary       string
+	Workspace              string
+	Commit                 string
+	Branch                 string
+	Remote                 string
+	RemoteSSH              string
+	UseSSH                 bool
+	Depth                  int
+	Tags                   bool
+	Attempts               int
+	Backoff                time.Duration
+	FetchTimeout           time.Duration
+	IdleTimeout            time.Duration
+	ProtocolVersion        string
+	SSHConnectTimeout      time.Duration
+	SSHServerAliveInterval time.Duration
+	SSHServerAliveCountMax int
+	SSHKeyPrivate          string
+	SSHHostKey             string
+	NetrcMachine           string
+	NetrcUsername          string
+	NetrcPassword          string
+	Home                   string
+	GitBinary              string
 }
 
 func main() {
@@ -57,26 +60,29 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		Workspace:       envOr("CI_WORKSPACE", "/woodpecker/src"),
-		Commit:          os.Getenv("CI_COMMIT_SHA"),
-		Branch:          os.Getenv("CI_COMMIT_BRANCH"),
-		Remote:          envOr("PLUGIN_REMOTE", os.Getenv("CI_REPO_CLONE_URL")),
-		RemoteSSH:       envOr("PLUGIN_REMOTE_SSH", os.Getenv("CI_REPO_CLONE_SSH_URL")),
-		UseSSH:          envBool("PLUGIN_USE_SSH", false),
-		Depth:           envInt("PLUGIN_DEPTH", 1),
-		Tags:            envBool("PLUGIN_TAGS", false),
-		Attempts:        envInt("PLUGIN_ATTEMPTS", 3),
-		Backoff:         envDuration("PLUGIN_BACKOFF", 5*time.Second),
-		FetchTimeout:    envDuration("PLUGIN_FETCH_TIMEOUT", 10*time.Minute),
-		IdleTimeout:     envDuration("PLUGIN_IDLE_TIMEOUT", 90*time.Second),
-		ProtocolVersion: envOr("PLUGIN_PROTOCOL_VERSION", "0"),
-		SSHKeyPrivate:   os.Getenv("PLUGIN_SSH_KEY_PRIVATE"),
-		SSHHostKey:      os.Getenv("PLUGIN_SSH_HOST_KEY"),
-		NetrcMachine:    os.Getenv("CI_NETRC_MACHINE"),
-		NetrcUsername:   os.Getenv("CI_NETRC_USERNAME"),
-		NetrcPassword:   os.Getenv("CI_NETRC_PASSWORD"),
-		Home:            envOr("HOME", "/root"),
-		GitBinary:       envOr("PLUGIN_GIT_BINARY", "git"),
+		Workspace:              envOr("CI_WORKSPACE", "/woodpecker/src"),
+		Commit:                 os.Getenv("CI_COMMIT_SHA"),
+		Branch:                 os.Getenv("CI_COMMIT_BRANCH"),
+		Remote:                 envOr("PLUGIN_REMOTE", os.Getenv("CI_REPO_CLONE_URL")),
+		RemoteSSH:              envOr("PLUGIN_REMOTE_SSH", os.Getenv("CI_REPO_CLONE_SSH_URL")),
+		UseSSH:                 envBool("PLUGIN_USE_SSH", false),
+		Depth:                  envInt("PLUGIN_DEPTH", 1),
+		Tags:                   envBool("PLUGIN_TAGS", false),
+		Attempts:               envInt("PLUGIN_ATTEMPTS", 3),
+		Backoff:                envDuration("PLUGIN_BACKOFF", 5*time.Second),
+		FetchTimeout:           envDuration("PLUGIN_FETCH_TIMEOUT", 10*time.Minute),
+		IdleTimeout:            envDuration("PLUGIN_IDLE_TIMEOUT", 90*time.Second),
+		ProtocolVersion:        envOr("PLUGIN_PROTOCOL_VERSION", "0"),
+		SSHConnectTimeout:      envDuration("PLUGIN_SSH_CONNECT_TIMEOUT", 10*time.Second),
+		SSHServerAliveInterval: envDuration("PLUGIN_SSH_SERVER_ALIVE_INTERVAL", 5*time.Second),
+		SSHServerAliveCountMax: envInt("PLUGIN_SSH_SERVER_ALIVE_COUNT_MAX", 3),
+		SSHKeyPrivate:          os.Getenv("PLUGIN_SSH_KEY_PRIVATE"),
+		SSHHostKey:             os.Getenv("PLUGIN_SSH_HOST_KEY"),
+		NetrcMachine:           os.Getenv("CI_NETRC_MACHINE"),
+		NetrcUsername:          os.Getenv("CI_NETRC_USERNAME"),
+		NetrcPassword:          os.Getenv("CI_NETRC_PASSWORD"),
+		Home:                   envOr("HOME", "/root"),
+		GitBinary:              envOr("PLUGIN_GIT_BINARY", "git"),
 	}
 	if cfg.UseSSH {
 		cfg.Remote = cfg.RemoteSSH
@@ -99,7 +105,8 @@ func loadConfig() (config, error) {
 	if cfg.UseSSH && cfg.SSHHostKey == "" {
 		return config{}, errors.New("PLUGIN_SSH_HOST_KEY is required for SSH clone")
 	}
-	if cfg.Depth < 0 || cfg.Attempts < 1 || cfg.FetchTimeout <= 0 || cfg.IdleTimeout <= 0 {
+	if cfg.Depth < 0 || cfg.Attempts < 1 || cfg.FetchTimeout <= 0 || cfg.IdleTimeout <= 0 ||
+		cfg.SSHConnectTimeout <= 0 || cfg.SSHServerAliveInterval <= 0 || cfg.SSHServerAliveCountMax < 1 {
 		return config{}, errors.New("invalid clone timeout, depth, or attempts setting")
 	}
 	return cfg, nil
@@ -117,16 +124,21 @@ func clone(cfg config, output io.Writer) error {
 		if attempt > 1 {
 			fmt.Fprintf(output, "resilient-git: retrying fetch (attempt %d/%d)\n", attempt, cfg.Attempts)
 		}
+		fmt.Fprintf(output, "resilient-git: fetch attempt %d/%d started (idle timeout %s, total timeout %s)\n", attempt, cfg.Attempts, cfg.IdleTimeout, cfg.FetchTimeout)
 		if err := initializeRepository(cfg, output); err != nil {
+			reportAttemptFailure(output, attempt, cfg.Attempts, err)
 			return err
 		}
 		if err := fetchCommit(cfg, output); err != nil {
 			_ = os.RemoveAll(filepath.Join(cfg.Workspace, ".git"))
+			reportAttemptFailure(output, attempt, cfg.Attempts, err)
 			return err
 		}
 		if err := runGit(cfg, output, "-C", cfg.Workspace, "reset", "--hard", "-q", cfg.Commit); err != nil {
 			_ = os.RemoveAll(filepath.Join(cfg.Workspace, ".git"))
-			return fmt.Errorf("checkout %s: %w", cfg.Commit, err)
+			err = fmt.Errorf("checkout %s: %w", cfg.Commit, err)
+			reportAttemptFailure(output, attempt, cfg.Attempts, err)
+			return err
 		}
 		return nil
 	})
@@ -181,8 +193,10 @@ func initializeRepository(cfg config, output io.Writer) error {
 	if cfg.UseSSH {
 		sshCommand := "ssh -i " + shellQuote(filepath.Join(cfg.Home, "sshkey")) +
 			" -o UserKnownHostsFile=" + shellQuote(filepath.Join(cfg.Home, ".ssh", "known_hosts")) +
-			" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15" +
-			" -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+			" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectionAttempts=1" +
+			" -o ConnectTimeout=" + strconv.Itoa(durationSeconds(cfg.SSHConnectTimeout)) +
+			" -o ServerAliveInterval=" + strconv.Itoa(durationSeconds(cfg.SSHServerAliveInterval)) +
+			" -o ServerAliveCountMax=" + strconv.Itoa(cfg.SSHServerAliveCountMax)
 		if err := runGit(cfg, output, "-C", cfg.Workspace, "config", "--global", "core.sshCommand", sshCommand); err != nil {
 			return fmt.Errorf("configure SSH: %w", err)
 		}
@@ -229,6 +243,33 @@ func retry(attempts int, backoff time.Duration, fn func(int) error) error {
 		}
 	}
 	return fmt.Errorf("all %d fetch attempts failed: %w", attempts, lastErr)
+}
+
+func reportAttemptFailure(output io.Writer, attempt, attempts int, err error) {
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	fmt.Fprintf(output, "resilient-git: attempt %d/%d failed (%s): %s\n", attempt, attempts, errorKind(err), message)
+}
+
+func errorKind(err error) string {
+	switch {
+	case errors.Is(err, ErrIdleTimeout):
+		return "idle-timeout"
+	case errors.Is(err, ErrCommandTimeout):
+		return "command-timeout"
+	default:
+		return "git-error"
+	}
+}
+
+func durationSeconds(value time.Duration) int {
+	seconds := int(value / time.Second)
+	if value%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func runCommand(name string, args []string, output io.Writer, totalTimeout, idleTimeout time.Duration) error {

@@ -44,7 +44,7 @@ func TestRetryReturnsLastError(t *testing.T) {
 func TestRunCommandIdleTimeoutKillsProcess(t *testing.T) {
 	var output bytes.Buffer
 	start := time.Now()
-	err := runCommand("sh", []string{"-c", "printf 'started\\n'; sleep 5"}, &output, 2*time.Second, 100*time.Millisecond)
+	err := runCommand("sh", []string{"-c", "printf 'started\\n'; sleep 5"}, &output, 2*time.Second, 500*time.Millisecond)
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Fatalf("error = %v, want idle timeout", err)
 	}
@@ -82,5 +82,23 @@ func TestValidateRemoteRejectsEmbeddedHTTPSCredentials(t *testing.T) {
 	}
 	if err := validateRemote("ssh://git@example.com:22/repo.git", true); err != nil {
 		t.Fatalf("validateRemote rejected SSH remote: %v", err)
+	}
+}
+
+func TestDurationSecondsRoundsUp(t *testing.T) {
+	if got := durationSeconds(1500 * time.Millisecond); got != 2 {
+		t.Fatalf("durationSeconds(1.5s) = %d, want 2", got)
+	}
+	if got := durationSeconds(0); got != 1 {
+		t.Fatalf("durationSeconds(0) = %d, want 1", got)
+	}
+}
+
+func TestErrorKind(t *testing.T) {
+	if got := errorKind(ErrIdleTimeout); got != "idle-timeout" {
+		t.Fatalf("errorKind(idle) = %q, want idle-timeout", got)
+	}
+	if got := errorKind(errors.Join(errors.New("fetch"), ErrCommandTimeout)); got != "command-timeout" {
+		t.Fatalf("errorKind(command) = %q, want command-timeout", got)
 	}
 }

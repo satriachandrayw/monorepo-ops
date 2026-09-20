@@ -13,6 +13,10 @@ executable rather than implementing Git itself.
 - Adds a hard fetch timeout and an inactivity timeout.
 - Kills the complete `git`/`ssh` process group when a timeout fires.
 - Retries from a clean `.git` directory with exponential backoff.
+- Emits a bounded diagnostic for every attempt, including whether the failure was
+  a Git error, idle timeout, or total command timeout.
+- Uses bounded SSH connection and keepalive settings so a dead SSH session fails
+  early enough for the next clean retry.
 - Defaults to Git protocol v0; set `PLUGIN_PROTOCOL_VERSION=2` to compare.
 - Does not print credential values or credential-bearing URLs.
 
@@ -39,6 +43,9 @@ by digest when promoting it beyond a canary.
 | `PLUGIN_FETCH_TIMEOUT` | `10m` | Maximum time for one Git command |
 | `PLUGIN_IDLE_TIMEOUT` | `90s` | Maximum time without Git output |
 | `PLUGIN_PROTOCOL_VERSION` | `0` | Git protocol version |
+| `PLUGIN_SSH_CONNECT_TIMEOUT` | `10s` | SSH connection timeout |
+| `PLUGIN_SSH_SERVER_ALIVE_INTERVAL` | `5s` | SSH keepalive interval |
+| `PLUGIN_SSH_SERVER_ALIVE_COUNT_MAX` | `3` | Keepalive failures before SSH closes |
 | `PLUGIN_SSH_KEY_PRIVATE` | empty | Private key content for SSH clone |
 | `PLUGIN_SSH_HOST_KEY` | empty | Pinned known-hosts content |
 
