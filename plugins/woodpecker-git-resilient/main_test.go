@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +107,63 @@ func TestBuildSSHCommandIncludesHostKeyAlias(t *testing.T) {
 	if !strings.Contains(command, "-o HostKeyAlias='github.com'") {
 		t.Fatalf("SSH command = %q, want host key alias", command)
 	}
+}
+
+func TestMirrorCloneReusesCommitWithoutRemoteFetch(t *testing.T) {
+	source := t.TempDir()
+	runTestGit(t, source, "init", "--initial-branch=main")
+	runTestGit(t, source, "config", "user.email", "test@example.com")
+	runTestGit(t, source, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("cached clone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, source, "add", "README.md")
+	runTestGit(t, source, "commit", "-m", "initial")
+	commit := strings.TrimSpace(runTestGit(t, source, "rev-parse", "HEAD"))
+
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	cfg := config{
+		Workspace:       filepath.Join(t.TempDir(), "workspace"),
+		Commit:          commit,
+		Remote:          source,
+		Depth:           1,
+		Attempts:        1,
+		FetchTimeout:    10 * time.Second,
+		IdleTimeout:     time.Second,
+		ProtocolVersion: "2",
+		Home:            t.TempDir(),
+		GitBinary:       "git",
+		MirrorPath:      mirror,
+		MirrorDepth:     5,
+	}
+	var first bytes.Buffer
+	if err := clone(cfg, &first); err != nil {
+		t.Fatalf("first clone: %v\n%s", err, first.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(cfg.Workspace, "README.md")); err != nil || string(got) != "cached clone\n" {
+		t.Fatalf("first clone content = %q, err = %v", got, err)
+	}
+	if err := os.RemoveAll(cfg.Workspace); err != nil {
+		t.Fatal(err)
+	}
+	var second bytes.Buffer
+	if err := clone(cfg, &second); err != nil {
+		t.Fatalf("cached clone: %v\n%s", err, second.String())
+	}
+	if !strings.Contains(second.String(), "mirror cache hit") {
+		t.Fatalf("cached clone output = %q, want mirror cache hit", second.String())
+	}
+}
+
+func runTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return string(output)
 }
 
 func TestErrorKind(t *testing.T) {

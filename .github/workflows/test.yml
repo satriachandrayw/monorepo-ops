@@ -18,7 +18,8 @@ jobs:
         run: >-
           docker run --rm
           -v "$GITHUB_WORKSPACE/plugins/woodpecker-git-resilient:/src:ro"
-          -w /src golang:1.24-alpine go test ./...
+          -w /src golang:1.24-alpine
+          sh -c 'apk add --no-cache git >/dev/null && go test ./...'
       - name: Run Go vet
         run: >-
           docker run --rm

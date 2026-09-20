@@ -45,6 +45,8 @@ type config struct {
 	NetrcPassword          string
 	Home                   string
 	GitBinary              string
+	MirrorPath             string
+	MirrorDepth            int
 }
 
 func main() {
@@ -85,6 +87,8 @@ func loadConfig() (config, error) {
 		NetrcPassword:          os.Getenv("CI_NETRC_PASSWORD"),
 		Home:                   envOr("HOME", "/root"),
 		GitBinary:              envOr("PLUGIN_GIT_BINARY", "git"),
+		MirrorPath:             os.Getenv("PLUGIN_MIRROR_PATH"),
+		MirrorDepth:            envInt("PLUGIN_MIRROR_DEPTH", 5),
 	}
 	if cfg.UseSSH {
 		cfg.Remote = cfg.RemoteSSH
@@ -108,8 +112,9 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("PLUGIN_SSH_HOST_KEY is required for SSH clone")
 	}
 	if cfg.Depth < 0 || cfg.Attempts < 1 || cfg.FetchTimeout <= 0 || cfg.IdleTimeout <= 0 ||
-		cfg.SSHConnectTimeout <= 0 || cfg.SSHServerAliveInterval <= 0 || cfg.SSHServerAliveCountMax < 1 {
-		return config{}, errors.New("invalid clone timeout, depth, or attempts setting")
+		cfg.SSHConnectTimeout <= 0 || cfg.SSHServerAliveInterval <= 0 || cfg.SSHServerAliveCountMax < 1 ||
+		(cfg.MirrorPath != "" && (!filepath.IsAbs(cfg.MirrorPath) || cfg.MirrorDepth < 1)) {
+		return config{}, errors.New("invalid clone timeout, depth, attempts, or mirror setting")
 	}
 	return cfg, nil
 }
@@ -127,14 +132,25 @@ func clone(cfg config, output io.Writer) error {
 			fmt.Fprintf(output, "resilient-git: retrying fetch (attempt %d/%d)\n", attempt, cfg.Attempts)
 		}
 		fmt.Fprintf(output, "resilient-git: fetch attempt %d/%d started (idle timeout %s, total timeout %s)\n", attempt, cfg.Attempts, cfg.IdleTimeout, cfg.FetchTimeout)
-		if err := initializeRepository(cfg, output); err != nil {
-			reportAttemptFailure(output, attempt, cfg.Attempts, err)
-			return err
-		}
-		if err := fetchCommit(cfg, output); err != nil {
-			_ = os.RemoveAll(filepath.Join(cfg.Workspace, ".git"))
-			reportAttemptFailure(output, attempt, cfg.Attempts, err)
-			return err
+		if cfg.MirrorPath != "" {
+			if err := ensureMirrorCommit(cfg, output); err != nil {
+				reportAttemptFailure(output, attempt, cfg.Attempts, err)
+				return err
+			}
+			if err := initializeFromMirror(cfg, output); err != nil {
+				reportAttemptFailure(output, attempt, cfg.Attempts, err)
+				return err
+			}
+		} else {
+			if err := initializeRepository(cfg, output); err != nil {
+				reportAttemptFailure(output, attempt, cfg.Attempts, err)
+				return err
+			}
+			if err := fetchCommit(cfg, output); err != nil {
+				_ = os.RemoveAll(filepath.Join(cfg.Workspace, ".git"))
+				reportAttemptFailure(output, attempt, cfg.Attempts, err)
+				return err
+			}
 		}
 		if err := runGit(cfg, output, "-C", cfg.Workspace, "reset", "--hard", "-q", cfg.Commit); err != nil {
 			_ = os.RemoveAll(filepath.Join(cfg.Workspace, ".git"))
@@ -169,6 +185,126 @@ func prepareCredentials(cfg config) error {
 	}
 	if err := os.WriteFile(filepath.Join(sshDir, "known_hosts"), []byte(cfg.SSHHostKey), 0o600); err != nil {
 		return fmt.Errorf("write SSH host key: %w", err)
+	}
+	return nil
+}
+
+func ensureMirrorCommit(cfg config, output io.Writer) error {
+	if err := os.MkdirAll(filepath.Dir(cfg.MirrorPath), 0o755); err != nil {
+		return fmt.Errorf("create mirror parent: %w", err)
+	}
+	lock, err := os.OpenFile(cfg.MirrorPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open mirror lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock mirror: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	if _, err := os.Stat(filepath.Join(cfg.MirrorPath, "config")); os.IsNotExist(err) {
+		if err := runGit(cfg, output, "init", "--bare", "--object-format", "sha1", cfg.MirrorPath); err != nil {
+			return fmt.Errorf("initialize mirror: %w", err)
+		}
+	}
+	if err := runGit(cfg, io.Discard, "-C", cfg.MirrorPath, "remote", "set-url", "origin", cfg.Remote); err != nil {
+		if err := runGit(cfg, output, "-C", cfg.MirrorPath, "remote", "add", "origin", cfg.Remote); err != nil {
+			return fmt.Errorf("configure mirror origin: %w", err)
+		}
+	}
+	if cfg.UseSSH {
+		if err := runGit(cfg, output, "-C", cfg.MirrorPath, "config", "core.sshCommand", buildSSHCommand(cfg)); err != nil {
+			return fmt.Errorf("configure mirror SSH: %w", err)
+		}
+	}
+	if err := configureLocalRemoteSafety(cfg); err != nil {
+		return err
+	}
+	if mirrorHasCommit(cfg) {
+		fmt.Fprintf(output, "resilient-git: mirror cache hit for %s\n", cfg.Commit)
+		return nil
+	}
+
+	args := []string{"-C", cfg.MirrorPath}
+	if cfg.ProtocolVersion != "" {
+		args = append(args, "-c", "protocol.version="+cfg.ProtocolVersion)
+	}
+	args = append(args, "fetch", "--no-tags", "--depth", strconv.Itoa(cfg.MirrorDepth), "origin", "+"+cfg.Commit+":refs/heads/woodpecker-cache")
+	if err := runGit(cfg, output, args...); err != nil {
+		return fmt.Errorf("update mirror for %s: %w", cfg.Commit, err)
+	}
+	if err := runGit(cfg, output, "-C", cfg.MirrorPath, "symbolic-ref", "HEAD", "refs/heads/woodpecker-cache"); err != nil {
+		return fmt.Errorf("set mirror HEAD: %w", err)
+	}
+	if !mirrorHasCommit(cfg) {
+		return fmt.Errorf("mirror does not contain %s after fetch", cfg.Commit)
+	}
+	fmt.Fprintf(output, "resilient-git: mirror updated for %s\n", cfg.Commit)
+	return nil
+}
+
+func configureLocalRemoteSafety(cfg config) error {
+	if cfg.UseSSH {
+		return nil
+	}
+	parsed, err := url.Parse(cfg.Remote)
+	if err != nil || (parsed.Scheme != "" && parsed.Scheme != "file") {
+		return nil
+	}
+	path := cfg.Remote
+	if parsed.Scheme == "file" {
+		path = parsed.Path
+	}
+	if path == "" {
+		return nil
+	}
+	if err := runGit(cfg, io.Discard, "config", "--global", "--add", "safe.directory", path); err != nil {
+		return fmt.Errorf("configure local remote safety: %w", err)
+	}
+	return nil
+}
+
+func mirrorHasCommit(cfg config) bool {
+	return runGit(cfg, io.Discard, "-C", cfg.MirrorPath, "cat-file", "-e", cfg.Commit+"^{commit}") == nil
+}
+
+func cleanWorkspace(workspace string) error {
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(workspace)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(workspace, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func initializeFromMirror(cfg config, output io.Writer) error {
+	if err := cleanWorkspace(cfg.Workspace); err != nil {
+		return fmt.Errorf("clean workspace: %w", err)
+	}
+	if err := os.MkdirAll(cfg.Workspace, 0o755); err != nil {
+		return fmt.Errorf("create workspace: %w", err)
+	}
+	if err := runGit(cfg, output, "clone", "--no-hardlinks", "--no-checkout", cfg.MirrorPath, cfg.Workspace); err != nil {
+		return fmt.Errorf("clone from mirror: %w", err)
+	}
+	if err := runGit(cfg, output, "-C", cfg.Workspace, "config", "--global", "--replace-all", "safe.directory", cfg.Workspace); err != nil {
+		return fmt.Errorf("configure safe directory: %w", err)
+	}
+	if err := runGit(cfg, output, "-C", cfg.Workspace, "remote", "set-url", "origin", cfg.Remote); err != nil {
+		return fmt.Errorf("configure origin: %w", err)
+	}
+	if cfg.UseSSH {
+		if err := runGit(cfg, output, "-C", cfg.Workspace, "config", "--global", "core.sshCommand", buildSSHCommand(cfg)); err != nil {
+			return fmt.Errorf("configure SSH: %w", err)
+		}
 	}
 	return nil
 }

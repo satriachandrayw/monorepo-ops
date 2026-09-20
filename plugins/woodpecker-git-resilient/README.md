@@ -17,6 +17,10 @@ executable rather than implementing Git itself.
   a Git error, idle timeout, or total command timeout.
 - Uses bounded SSH connection and keepalive settings so a dead SSH session fails
   early enough for the next clean retry.
+- Supports an optional persistent local mirror. After the mirror is warmed once,
+  repeated clones of the same commit copy from local Git objects instead of
+  opening a GitHub transport. The mirror is protected by a cross-process lock
+  so multiple Woodpecker agents can share one named Docker volume.
 - Supports GitHub SSH over port 443 through `ssh.github.com` when the
   `PLUGIN_SSH_HOST_KEY_ALIAS` setting is set to `github.com`; this avoids networks
   that interfere with long-lived SSH sessions on port 22.
@@ -50,6 +54,8 @@ by digest when promoting it beyond a canary.
 | `PLUGIN_SSH_SERVER_ALIVE_INTERVAL` | `5s` | SSH keepalive interval |
 | `PLUGIN_SSH_SERVER_ALIVE_COUNT_MAX` | `3` | Keepalive failures before SSH closes |
 | `PLUGIN_SSH_HOST_KEY_ALIAS` | empty | SSH `HostKeyAlias` used to match a pinned known-hosts entry when the transport hostname differs |
+| `PLUGIN_MIRROR_PATH` | empty | Absolute path to a persistent bare Git mirror; empty disables the mirror |
+| `PLUGIN_MIRROR_DEPTH` | `5` | Shallow depth used when updating the persistent mirror |
 | `PLUGIN_SSH_KEY_PRIVATE` | empty | Private key content for SSH clone |
 | `PLUGIN_SSH_HOST_KEY` | empty | Pinned known-hosts content |
 
