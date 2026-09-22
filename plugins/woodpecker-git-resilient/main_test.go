@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +46,7 @@ func TestRetryReturnsLastError(t *testing.T) {
 func TestRunCommandIdleTimeoutKillsProcess(t *testing.T) {
 	var output bytes.Buffer
 	start := time.Now()
-	err := runCommand("sh", []string{"-c", "printf 'started\\n'; sleep 5"}, &output, 2*time.Second, 100*time.Millisecond)
+	err := runCommand("sh", []string{"-c", "printf 'started\\n'; sleep 5"}, &output, 2*time.Second, 500*time.Millisecond)
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Fatalf("error = %v, want idle timeout", err)
 	}
@@ -82,5 +84,126 @@ func TestValidateRemoteRejectsEmbeddedHTTPSCredentials(t *testing.T) {
 	}
 	if err := validateRemote("ssh://git@example.com:22/repo.git", true); err != nil {
 		t.Fatalf("validateRemote rejected SSH remote: %v", err)
+	}
+}
+
+func TestDurationSecondsRoundsUp(t *testing.T) {
+	if got := durationSeconds(1500 * time.Millisecond); got != 2 {
+		t.Fatalf("durationSeconds(1.5s) = %d, want 2", got)
+	}
+	if got := durationSeconds(0); got != 1 {
+		t.Fatalf("durationSeconds(0) = %d, want 1", got)
+	}
+}
+
+func TestBuildSSHCommandIncludesHostKeyAlias(t *testing.T) {
+	command := buildSSHCommand(config{
+		Home:                   "/root",
+		SSHConnectTimeout:      10 * time.Second,
+		SSHServerAliveInterval: 5 * time.Second,
+		SSHServerAliveCountMax: 3,
+		SSHHostKeyAlias:        "github.com",
+	})
+	if !strings.Contains(command, "-o HostKeyAlias='github.com'") {
+		t.Fatalf("SSH command = %q, want host key alias", command)
+	}
+}
+
+func TestMirrorCloneReusesCommitWithoutRemoteFetch(t *testing.T) {
+	source := t.TempDir()
+	runTestGit(t, source, "init", "--initial-branch=main")
+	runTestGit(t, source, "config", "user.email", "test@example.com")
+	runTestGit(t, source, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("cached clone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, source, "add", "README.md")
+	runTestGit(t, source, "commit", "-m", "initial")
+	commit := strings.TrimSpace(runTestGit(t, source, "rev-parse", "HEAD"))
+
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	cfg := config{
+		Workspace:       filepath.Join(t.TempDir(), "workspace"),
+		Commit:          commit,
+		Remote:          source,
+		Depth:           1,
+		Attempts:        1,
+		FetchTimeout:    10 * time.Second,
+		IdleTimeout:     time.Second,
+		ProtocolVersion: "2",
+		Home:            t.TempDir(),
+		GitBinary:       "git",
+		MirrorPath:      mirror,
+		MirrorDepth:     5,
+	}
+	var first bytes.Buffer
+	if err := clone(cfg, &first); err != nil {
+		t.Fatalf("first clone: %v\n%s", err, first.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(cfg.Workspace, "README.md")); err != nil || string(got) != "cached clone\n" {
+		t.Fatalf("first clone content = %q, err = %v", got, err)
+	}
+	if err := os.RemoveAll(cfg.Workspace); err != nil {
+		t.Fatal(err)
+	}
+	var second bytes.Buffer
+	if err := clone(cfg, &second); err != nil {
+		t.Fatalf("cached clone: %v\n%s", err, second.String())
+	}
+	if !strings.Contains(second.String(), "mirror cache hit") {
+		t.Fatalf("cached clone output = %q, want mirror cache hit", second.String())
+	}
+}
+
+func TestRemoveStaleMirrorLocks(t *testing.T) {
+	mirror := t.TempDir()
+	staleRootLock := filepath.Join(mirror, "shallow.lock")
+	staleRefLock := filepath.Join(mirror, "refs", "heads", "woodpecker-cache.lock")
+	if err := os.MkdirAll(filepath.Dir(staleRefLock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{staleRootLock, staleRefLock} {
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mirror, "keep.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := removeStaleMirrorLocks(mirror, &output); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{staleRootLock, staleRefLock} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale lock %s still exists, stat error = %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(mirror, "keep.txt")); err != nil {
+		t.Fatalf("non-lock file was removed: %v", err)
+	}
+	if got := strings.Count(output.String(), "removed stale mirror lock"); got != 2 {
+		t.Fatalf("cleanup output count = %d, want 2: %q", got, output.String())
+	}
+}
+
+func runTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return string(output)
+}
+
+func TestErrorKind(t *testing.T) {
+	if got := errorKind(ErrIdleTimeout); got != "idle-timeout" {
+		t.Fatalf("errorKind(idle) = %q, want idle-timeout", got)
+	}
+	if got := errorKind(errors.Join(errors.New("fetch"), ErrCommandTimeout)); got != "command-timeout" {
+		t.Fatalf("errorKind(command) = %q, want command-timeout", got)
 	}
 }
