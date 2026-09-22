@@ -155,6 +155,39 @@ func TestMirrorCloneReusesCommitWithoutRemoteFetch(t *testing.T) {
 	}
 }
 
+func TestRemoveStaleMirrorLocks(t *testing.T) {
+	mirror := t.TempDir()
+	staleRootLock := filepath.Join(mirror, "shallow.lock")
+	staleRefLock := filepath.Join(mirror, "refs", "heads", "woodpecker-cache.lock")
+	if err := os.MkdirAll(filepath.Dir(staleRefLock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{staleRootLock, staleRefLock} {
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mirror, "keep.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := removeStaleMirrorLocks(mirror, &output); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{staleRootLock, staleRefLock} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale lock %s still exists, stat error = %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(mirror, "keep.txt")); err != nil {
+		t.Fatalf("non-lock file was removed: %v", err)
+	}
+	if got := strings.Count(output.String(), "removed stale mirror lock"); got != 2 {
+		t.Fatalf("cleanup output count = %d, want 2: %q", got, output.String())
+	}
+}
+
 func runTestGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

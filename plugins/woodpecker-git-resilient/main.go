@@ -221,6 +221,9 @@ func ensureMirrorCommit(cfg config, output io.Writer) error {
 	if err := configureLocalRemoteSafety(cfg); err != nil {
 		return err
 	}
+	if err := removeStaleMirrorLocks(cfg.MirrorPath, output); err != nil {
+		return err
+	}
 	if mirrorHasCommit(cfg) {
 		fmt.Fprintf(output, "resilient-git: mirror cache hit for %s\n", cfg.Commit)
 		return nil
@@ -242,6 +245,22 @@ func ensureMirrorCommit(cfg config, output io.Writer) error {
 	}
 	fmt.Fprintf(output, "resilient-git: mirror updated for %s\n", cfg.Commit)
 	return nil
+}
+
+func removeStaleMirrorLocks(mirrorPath string, output io.Writer) error {
+	return filepath.WalkDir(mirrorPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("inspect mirror lock state: %w", err)
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lock") {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove stale mirror lock %s: %w", path, err)
+		}
+		fmt.Fprintf(output, "resilient-git: removed stale mirror lock %s\n", path)
+		return nil
+	})
 }
 
 func configureLocalRemoteSafety(cfg config) error {
