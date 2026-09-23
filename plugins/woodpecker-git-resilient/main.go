@@ -133,11 +133,7 @@ func clone(cfg config, output io.Writer) error {
 		}
 		fmt.Fprintf(output, "resilient-git: fetch attempt %d/%d started (idle timeout %s, total timeout %s)\n", attempt, cfg.Attempts, cfg.IdleTimeout, cfg.FetchTimeout)
 		if cfg.MirrorPath != "" {
-			if err := ensureMirrorCommit(cfg, output); err != nil {
-				reportAttemptFailure(output, attempt, cfg.Attempts, err)
-				return err
-			}
-			if err := initializeFromMirror(cfg, output); err != nil {
+			if err := cloneFromMirror(cfg, output); err != nil {
 				reportAttemptFailure(output, attempt, cfg.Attempts, err)
 				return err
 			}
@@ -189,11 +185,23 @@ func prepareCredentials(cfg config) error {
 	return nil
 }
 
-func ensureMirrorCommit(cfg config, output io.Writer) error {
-	if err := os.MkdirAll(filepath.Dir(cfg.MirrorPath), 0o755); err != nil {
+func cloneFromMirror(cfg config, output io.Writer) error {
+	return withMirrorLock(cfg.MirrorPath, func() error {
+		if err := ensureMirrorCommitLocked(cfg, output); err != nil {
+			return err
+		}
+		// Keep the lock until the workspace has copied the requested commit.
+		// Another clone may advance the mirror's shallow HEAD after the cache
+		// check, making the object unavailable to this local clone.
+		return initializeFromMirror(cfg, output)
+	})
+}
+
+func withMirrorLock(mirrorPath string, operation func() error) error {
+	if err := os.MkdirAll(filepath.Dir(mirrorPath), 0o755); err != nil {
 		return fmt.Errorf("create mirror parent: %w", err)
 	}
-	lock, err := os.OpenFile(cfg.MirrorPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := os.OpenFile(mirrorPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open mirror lock: %w", err)
 	}
@@ -202,7 +210,10 @@ func ensureMirrorCommit(cfg config, output io.Writer) error {
 		return fmt.Errorf("lock mirror: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return operation()
+}
 
+func ensureMirrorCommitLocked(cfg config, output io.Writer) error {
 	if _, err := os.Stat(filepath.Join(cfg.MirrorPath, "config")); os.IsNotExist(err) {
 		if err := runGit(cfg, output, "init", "--bare", "--object-format", "sha1", cfg.MirrorPath); err != nil {
 			return fmt.Errorf("initialize mirror: %w", err)
@@ -224,24 +235,32 @@ func ensureMirrorCommit(cfg config, output io.Writer) error {
 	if err := removeStaleMirrorLocks(cfg.MirrorPath, output); err != nil {
 		return err
 	}
-	if mirrorHasCommit(cfg) {
-		fmt.Fprintf(output, "resilient-git: mirror cache hit for %s\n", cfg.Commit)
-		return nil
-	}
 
-	args := []string{"-C", cfg.MirrorPath}
-	if cfg.ProtocolVersion != "" {
-		args = append(args, "-c", "protocol.version="+cfg.ProtocolVersion)
+	cacheHit := mirrorHasCommit(cfg)
+	if !cacheHit {
+		args := []string{"-C", cfg.MirrorPath}
+		if cfg.ProtocolVersion != "" {
+			args = append(args, "-c", "protocol.version="+cfg.ProtocolVersion)
+		}
+		args = append(args, "fetch", "--no-tags", "--depth", strconv.Itoa(cfg.MirrorDepth), "origin", "+"+cfg.Commit+":refs/heads/woodpecker-cache")
+		if err := runGit(cfg, output, args...); err != nil {
+			return fmt.Errorf("update mirror for %s: %w", cfg.Commit, err)
+		}
 	}
-	args = append(args, "fetch", "--no-tags", "--depth", strconv.Itoa(cfg.MirrorDepth), "origin", "+"+cfg.Commit+":refs/heads/woodpecker-cache")
-	if err := runGit(cfg, output, args...); err != nil {
-		return fmt.Errorf("update mirror for %s: %w", cfg.Commit, err)
+	// A cache hit may refer to an older object than the mirror's current HEAD.
+	// Point the shallow mirror at the requested commit before cloning it.
+	if err := runGit(cfg, output, "-C", cfg.MirrorPath, "update-ref", "refs/heads/woodpecker-cache", cfg.Commit); err != nil {
+		return fmt.Errorf("set mirror ref for %s: %w", cfg.Commit, err)
 	}
 	if err := runGit(cfg, output, "-C", cfg.MirrorPath, "symbolic-ref", "HEAD", "refs/heads/woodpecker-cache"); err != nil {
 		return fmt.Errorf("set mirror HEAD: %w", err)
 	}
 	if !mirrorHasCommit(cfg) {
 		return fmt.Errorf("mirror does not contain %s after fetch", cfg.Commit)
+	}
+	if cacheHit {
+		fmt.Fprintf(output, "resilient-git: mirror cache hit for %s\n", cfg.Commit)
+		return nil
 	}
 	fmt.Fprintf(output, "resilient-git: mirror updated for %s\n", cfg.Commit)
 	return nil

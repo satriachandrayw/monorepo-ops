@@ -119,12 +119,12 @@ func TestMirrorCloneReusesCommitWithoutRemoteFetch(t *testing.T) {
 	}
 	runTestGit(t, source, "add", "README.md")
 	runTestGit(t, source, "commit", "-m", "initial")
-	commit := strings.TrimSpace(runTestGit(t, source, "rev-parse", "HEAD"))
+	firstCommit := strings.TrimSpace(runTestGit(t, source, "rev-parse", "HEAD"))
 
 	mirror := filepath.Join(t.TempDir(), "mirror.git")
 	cfg := config{
 		Workspace:       filepath.Join(t.TempDir(), "workspace"),
-		Commit:          commit,
+		Commit:          firstCommit,
 		Remote:          source,
 		Depth:           1,
 		Attempts:        1,
@@ -134,24 +134,46 @@ func TestMirrorCloneReusesCommitWithoutRemoteFetch(t *testing.T) {
 		Home:            t.TempDir(),
 		GitBinary:       "git",
 		MirrorPath:      mirror,
-		MirrorDepth:     5,
+		MirrorDepth:     1,
 	}
 	var first bytes.Buffer
 	if err := clone(cfg, &first); err != nil {
 		t.Fatalf("first clone: %v\n%s", err, first.String())
 	}
-	if got, err := os.ReadFile(filepath.Join(cfg.Workspace, "README.md")); err != nil || string(got) != "cached clone\n" {
-		t.Fatalf("first clone content = %q, err = %v", got, err)
-	}
-	if err := os.RemoveAll(cfg.Workspace); err != nil {
+	assertWorkspaceContent(t, cfg.Workspace, "cached clone\n")
+
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("newer clone\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var second bytes.Buffer
-	if err := clone(cfg, &second); err != nil {
-		t.Fatalf("cached clone: %v\n%s", err, second.String())
+	runTestGit(t, source, "add", "README.md")
+	runTestGit(t, source, "commit", "-m", "second")
+	secondCommit := strings.TrimSpace(runTestGit(t, source, "rev-parse", "HEAD"))
+	cfg.Commit = secondCommit
+	var newer bytes.Buffer
+	if err := clone(cfg, &newer); err != nil {
+		t.Fatalf("newer clone: %v\n%s", err, newer.String())
 	}
-	if !strings.Contains(second.String(), "mirror cache hit") {
-		t.Fatalf("cached clone output = %q, want mirror cache hit", second.String())
+	assertWorkspaceContent(t, cfg.Workspace, "newer clone\n")
+
+	// Re-request an older commit that remains in the mirror after its shallow
+	// HEAD advanced. The workspace clone must expose the requested commit, not
+	// just report a cache hit for an object it cannot copy from the current HEAD.
+	cfg.Commit = firstCommit
+	var cached bytes.Buffer
+	if err := clone(cfg, &cached); err != nil {
+		t.Fatalf("cached older clone: %v\n%s", err, cached.String())
+	}
+	if !strings.Contains(cached.String(), "mirror cache hit") {
+		t.Fatalf("cached clone output = %q, want mirror cache hit", cached.String())
+	}
+	assertWorkspaceContent(t, cfg.Workspace, "cached clone\n")
+}
+
+func assertWorkspaceContent(t *testing.T, workspace, want string) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(workspace, "README.md"))
+	if err != nil || string(got) != want {
+		t.Fatalf("workspace README = %q, want %q, err = %v", got, want, err)
 	}
 }
 
